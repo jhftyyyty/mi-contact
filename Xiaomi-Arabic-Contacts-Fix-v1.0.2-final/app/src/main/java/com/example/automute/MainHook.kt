@@ -129,9 +129,10 @@ class MainHook : IXposedHookLoadPackage {
             )
 
             hookXiaomiContactListClasses(classLoader)
+            hookExactXiaomiContactBinding(classLoader)
             hookActivityResume(classLoader)
 
-            XposedBridge.log("$LOG_TAG: Xiaomi Contacts v1.0.2 hooks installed")
+            XposedBridge.log("$LOG_TAG: Xiaomi Contacts v1.0.3 DEBUG hooks installed")
         } catch (t: Throwable) {
             XposedBridge.log("$LOG_TAG: Contacts hook error: ${t.stackTraceToString()}")
         }
@@ -182,6 +183,124 @@ class MainHook : IXposedHookLoadPackage {
             } catch (_: Throwable) {
                 // Class may not exist in another Contacts build.
             }
+        }
+    }
+
+    /**
+     * Exact diagnostics for Xiaomi Contacts 18.30.00.17.
+     * The previous generic method-name filter missed the obfuscated adapter method F3,
+     * which is the actual row-binding entry point in this build:
+     * F3(ContactListItemView, int, Cursor, int, int, int, String, int).
+     * This hook does not change the UI; it only records the real cursor/name flow.
+     */
+    private fun hookExactXiaomiContactBinding(classLoader: ClassLoader) {
+        try {
+            val adapter = XposedHelpers.findClass(
+                "com.android.contacts.list.DefaultContactListAdapter", classLoader
+            )
+            XposedHelpers.findAndHookMethod(
+                adapter,
+                "F3",
+                XposedHelpers.findClass("com.android.contacts.list.ContactListItemView", classLoader),
+                Int::class.javaPrimitiveType,
+                android.database.Cursor::class.java,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                String::class.java,
+                Int::class.javaPrimitiveType,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        debugLogF3("BEFORE", param)
+                    }
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        debugLogF3("AFTER", param)
+                    }
+                }
+            )
+            XposedBridge.log("$LOG_TAG: DEBUG exact F3(ContactListItemView,Cursor,...) hook installed")
+        } catch (t: Throwable) {
+            XposedBridge.log("$LOG_TAG: DEBUG exact F3 hook error: ${t.stackTraceToString()}")
+        }
+
+        // The row view has an explicit G(Cursor,String,int,int) method in this APK.
+        try {
+            val row = XposedHelpers.findClass(
+                "com.android.contacts.list.ContactListItemView", classLoader
+            )
+            XposedHelpers.findAndHookMethod(
+                row,
+                "G",
+                android.database.Cursor::class.java,
+                String::class.java,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        debugLogRowMethod("G BEFORE", param)
+                    }
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        debugLogRowMethod("G AFTER", param)
+                    }
+                }
+            )
+            XposedBridge.log("$LOG_TAG: DEBUG exact ContactListItemView.G hook installed")
+        } catch (t: Throwable) {
+            XposedBridge.log("$LOG_TAG: DEBUG exact G hook error: ${t.message}")
+        }
+    }
+
+    private fun debugLogF3(stage: String, param: XC_MethodHook.MethodHookParam) {
+        if (!DEBUG_MODE) return
+        try {
+            val row = param.args.getOrNull(0)
+            val cursor = param.args.getOrNull(2) as? android.database.Cursor
+            val cursorInfo = dumpCursorIdentity(cursor)
+            val rowClass = row?.javaClass?.name ?: "null"
+            val uri = try {
+                val m = row?.javaClass?.methods?.firstOrNull { it.name == "getmUri" && it.parameterTypes.isEmpty() }
+                m?.invoke(row)?.toString()
+            } catch (_: Throwable) { null }
+            XposedBridge.log(
+                "$LOG_TAG: DEBUG F3 $stage row=$rowClass uri=${uri ?: "null"} " +
+                        "arg1=${debugValue(param.args.getOrNull(1))} arg3=${debugValue(param.args.getOrNull(3))} " +
+                        "arg4=${debugValue(param.args.getOrNull(4))} arg5=${debugValue(param.args.getOrNull(5))} " +
+                        "arg6=${debugValue(param.args.getOrNull(6))} arg7=${debugValue(param.args.getOrNull(7))} " +
+                        "cursor=$cursorInfo"
+            )
+        } catch (t: Throwable) {
+            XposedBridge.log("$LOG_TAG: DEBUG F3 log error: ${t.message}")
+        }
+    }
+
+    private fun debugLogRowMethod(stage: String, param: XC_MethodHook.MethodHookParam) {
+        if (!DEBUG_MODE) return
+        try {
+            val cursor = param.args.getOrNull(0) as? android.database.Cursor
+            XposedBridge.log(
+                "$LOG_TAG: DEBUG ROW $stage this=${param.thisObject?.javaClass?.name} " +
+                        "arg1=${debugValue(param.args.getOrNull(1))} " +
+                        "arg2=${debugValue(param.args.getOrNull(2))} " +
+                        "arg3=${debugValue(param.args.getOrNull(3))} cursor=${dumpCursorIdentity(cursor)}"
+            )
+        } catch (t: Throwable) {
+            XposedBridge.log("$LOG_TAG: DEBUG ROW log error: ${t.message}")
+        }
+    }
+
+    private fun dumpCursorIdentity(cursor: android.database.Cursor?): String {
+        if (cursor == null) return "null"
+        return try {
+            val parts = ArrayList<String>()
+            val cols = cursor.columnNames
+            for (i in cols.indices) {
+                if (i >= 40) break
+                val value = try { cursor.getString(i) } catch (_: Throwable) { "<non-string>" }
+                parts.add("${cols[i]}=${quoteForLog(value ?: "null")}")
+            }
+            "pos=${cursor.position} count=${cursor.count} {${parts.joinToString(", ")}}"
+        } catch (t: Throwable) {
+            "cursor-error=${t.message}"
         }
     }
 

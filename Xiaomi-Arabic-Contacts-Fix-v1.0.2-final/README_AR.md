@@ -27,3 +27,8 @@ adb logcat -d -s DialerUnlocker:D *:S
 - methods في `ContactListItemView` والـ adapters التي يتم استدعاؤها أثناء إنشاء الصف.
 
 **مهم:** هذه النسخة تشخيصية ولا تصلح المسافات. هذا مقصود حتى تكون الـ logs دليلًا على المكان الحقيقي للمشكلة. بعد إرسال الـ logs أعمل النسخة النهائية على الـ method الصحيح.
+
+
+## v1.0.3 Debug
+
+هذه النسخة تضيف Hook مباشر للدالة F3 الخاصة بـ DefaultContactListAdapter في Contacts 18.30.00.17، لأن النسخة السابقة لم تكن تسجلها بسبب اسمها المختصر. كما تسجل Cursor columns وقيمة DISPLAY_NAME ومسار ContactListItemView.G بدون تعديل النص أثناء التشخيص.
