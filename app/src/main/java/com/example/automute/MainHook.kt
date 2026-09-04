@@ -3,6 +3,7 @@ package com.example.automute
 import android.content.Context
 import android.graphics.Canvas
 import android.database.Cursor
+import android.net.Uri
 import android.media.AudioManager
 import android.provider.ContactsContract
 import android.text.TextUtils
@@ -167,9 +168,138 @@ class MainHook : IXposedHookLoadPackage {
                 }
             )
 
+            hookXiaomiContactListRow(classLoader)
             XposedBridge.log("$LOG_TAG: Xiaomi Contacts text/draw hooks installed")
         } catch (t: Throwable) {
             XposedBridge.log("$LOG_TAG: Contacts hook error: ${t.stackTraceToString()}")
+        }
+    }
+
+    /**
+     * Xiaomi 18.30.x has a dedicated ContactListItemView and the main list adapter
+     * binds every row through DefaultContactListAdapter.F3(...).  Hooking that bind
+     * point is more reliable than trying to infer the original name from a TextView:
+     * the cursor/view already identifies the exact contact row.
+     */
+    private fun hookXiaomiContactListRow(classLoader: ClassLoader) {
+        try {
+            val itemViewClass = XposedHelpers.findClass(
+                "com.android.contacts.list.ContactListItemView",
+                classLoader
+            )
+
+            // Exact bind method found in Xiaomi Contacts 18.30.00.17:
+            // F3(ContactListItemView, int, Cursor, int, int, int, String, int)
+            XposedHelpers.findAndHookMethod(
+                "com.android.contacts.list.DefaultContactListAdapter",
+                classLoader,
+                "F3",
+                itemViewClass,
+                Int::class.javaPrimitiveType,
+                Cursor::class.java,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                String::class.java,
+                Int::class.javaPrimitiveType,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val itemView = param.args[0] ?: return
+                        restoreExactContactName(itemView, classLoader)
+                    }
+                }
+            )
+
+            // setUri is the row's exact contact URI.  Catching it gives us another
+            // reliable point even when Xiaomi recycles rows without F3 being called
+            // again in the usual way.
+            XposedHelpers.findAndHookMethod(
+                itemViewClass,
+                "setUri",
+                Uri::class.java,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        restoreExactContactName(param.thisObject, classLoader)
+                    }
+                }
+            )
+
+            // The list row exposes getNameTextView(), so we can correct the actual
+            // child used for the contact name rather than every TextView in Contacts.
+            XposedHelpers.findAndHookMethod(
+                itemViewClass,
+                "onLayout",
+                Boolean::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        restoreExactContactName(param.thisObject, classLoader)
+                    }
+                }
+            )
+
+            XposedBridge.log("$LOG_TAG: Exact Xiaomi contact-row hook installed")
+        } catch (t: Throwable) {
+            XposedBridge.log("$LOG_TAG: Contact-row hook error: ${t.stackTraceToString()}")
+        }
+    }
+
+    private fun restoreExactContactName(itemView: Any?, classLoader: ClassLoader) {
+        if (itemView == null || loadingContacts.get()) return
+        try {
+            val uri = XposedHelpers.callMethod(itemView, "getmUri") as? Uri ?: return
+            if (!isContactsUri(uri)) return
+
+            val view = itemView as? View ?: return
+            val context = view.context
+            val name = queryExactDisplayName(context, uri) ?: return
+            if (name.isEmpty() || !name.any { it.isWhitespace() }) return
+
+            val nameView = XposedHelpers.callMethod(itemView, "getNameTextView") as? TextView
+                ?: return
+            val displayed = nameView.text?.toString() ?: return
+
+            // Correct only the known failure mode: Xiaomi's displayed value is the
+            // same characters as the stored name, but whitespace has disappeared.
+            // This prevents us from overwriting highlighted/search text or another
+            // unrelated string shown in the row.
+            if (displayed != name &&
+                displayed.isNotEmpty() &&
+                whitespaceFreeKey(displayed) == whitespaceFreeKey(name)) {
+                nameView.text = name
+            }
+        } catch (t: Throwable) {
+            XposedBridge.log("$LOG_TAG: Exact row restore error: ${t.message}")
+        }
+    }
+
+    private fun isContactsUri(uri: Uri): Boolean {
+        return uri.authority == ContactsContract.AUTHORITY &&
+                (uri.pathSegments.firstOrNull() == "contacts" ||
+                 uri.pathSegments.firstOrNull() == "raw_contacts")
+    }
+
+    private fun queryExactDisplayName(context: Context, uri: Uri): String? {
+        return try {
+            val resolver = context.contentResolver
+            resolver.query(
+                uri,
+                arrayOf(ContactsContract.Contacts.DISPLAY_NAME),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val index = cursor.getColumnIndex(ContactsContract.Contacts.DISPLAY_NAME)
+                    if (index >= 0) cursor.getString(index) else null
+                } else null
+            }
+        } catch (t: Throwable) {
+            XposedBridge.log("$LOG_TAG: Exact name query error: ${t.message}")
+            null
         }
     }
 
