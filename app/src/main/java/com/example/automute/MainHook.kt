@@ -2,18 +2,19 @@ package com.example.automute
 
 import android.content.Context
 import android.graphics.Canvas
-import android.database.Cursor
-import android.net.Uri
 import android.media.AudioManager
+import android.net.Uri
 import android.provider.ContactsContract
-import android.text.TextUtils
 import android.view.View
+import android.view.ViewGroup
 import android.widget.TextView
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam
+import java.lang.reflect.Field
+import java.lang.reflect.Method
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
@@ -22,16 +23,20 @@ class MainHook : IXposedHookLoadPackage {
     companion object {
         private const val CONTACTS_PACKAGE = "com.android.contacts"
         private const val LOG_TAG = "DialerUnlocker"
+        private const val DEBUG_MODE = true
+        private const val MAX_RAW_TEXT_LOGS = 400
+        private const val MAX_VIEW_ATTACH_LOGS = 120
 
-        // Cache: text as it appears without whitespace -> the original stored display name.
         private val contactNameMap = ConcurrentHashMap<String, String>()
+        private val contactNameById = ConcurrentHashMap<Long, String>()
         private val loadedContexts = ConcurrentHashMap.newKeySet<String>()
-        private val loadingContacts = ThreadLocal.withInitial { false }
+        private val hookedContactClasses = ConcurrentHashMap.newKeySet<String>()
+        private val fixing = ThreadLocal.withInitial { false }
+        private val debugSeen = ConcurrentHashMap.newKeySet<String>()
     }
 
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
         val pkg = lpparam.packageName.lowercase(Locale.ROOT)
-
         val isContacts = pkg == CONTACTS_PACKAGE
         val isDialer = pkg.contains("incallui") ||
                 pkg.contains("dialer") ||
@@ -42,49 +47,24 @@ class MainHook : IXposedHookLoadPackage {
 
         XposedBridge.log("$LOG_TAG: Attached -> $pkg")
 
-        if (isContacts) {
-            hookContactsNameDisplay(lpparam.classLoader)
-        }
-
-        if (isDialer) {
-            hookMuteButton()
-        }
+        if (isContacts) hookContactsNameDisplay(lpparam.classLoader)
+        if (isDialer) hookMuteButton()
     }
 
-    /**
-     * Xiaomi Contacts keeps the real contact name in ContactsContract, but in some
-     * Arabic layouts the displayed value can lose whitespace during presentation.
-     *
-     * We do not modify the provider/database. Instead, when a TextView in the Contacts
-     * app is about to receive a string, we compare it with the stored display names and
-     * restore the exact stored value when the only apparent difference is whitespace.
-     */
     private fun hookContactsNameDisplay(classLoader: ClassLoader) {
         try {
-            // Xiaomi Contacts can pass the contact name through several UI paths.
-            // We therefore fix it both when TextView receives the text and immediately
-            // before TextView draws it. This covers list rows, contact details and
-            // screens that replace the text after our first hook.
-            val restoreHook = object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    restoreTextView(param.thisObject as? TextView)
-                }
-            }
-
+            // Framework TextView hooks catch ordinary and recycled rows.
             XposedHelpers.findAndHookMethod(
                 TextView::class.java,
                 "setText",
                 CharSequence::class.java,
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (loadingContacts.get()) return
-                        val value = param.args[0] as? CharSequence ?: return
-                        val text = value.toString()
+                        if (fixing.get()) return
                         val view = param.thisObject as? TextView ?: return
-                        val restored = restoreStoredSpacingForContext(view.context, text)
-                        if (restored != null && restored != text) {
-                            param.args[0] = restored
-                        }
+                        val value = param.args[0] as? CharSequence ?: return
+                        val fixed = restoreForTextView(view, value.toString())
+                        if (fixed != null && fixed != value.toString()) param.args[0] = fixed
                     }
                 }
             )
@@ -96,27 +76,15 @@ class MainHook : IXposedHookLoadPackage {
                 TextView.BufferType::class.java,
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (loadingContacts.get()) return
-                        val value = param.args[0] as? CharSequence ?: return
-                        val text = value.toString()
+                        if (fixing.get()) return
                         val view = param.thisObject as? TextView ?: return
-                        val restored = restoreStoredSpacingForContext(view.context, text)
-                        if (restored != null && restored != text) {
-                            param.args[0] = restored
-                        }
+                        val value = param.args[0] as? CharSequence ?: return
+                        val fixed = restoreForTextView(view, value.toString())
+                        if (fixed != null && fixed != value.toString()) param.args[0] = fixed
                     }
                 }
             )
 
-            // Covers code paths that modify the text after the normal setText hook.
-            XposedHelpers.findAndHookMethod(
-                TextView::class.java,
-                "onDraw",
-                Canvas::class.java,
-                restoreHook
-            )
-
-            // Xiaomi may use setTextKeepState when recycling contact-list rows.
             XposedHelpers.findAndHookMethod(
                 TextView::class.java,
                 "setTextKeepState",
@@ -124,35 +92,222 @@ class MainHook : IXposedHookLoadPackage {
                 TextView.BufferType::class.java,
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (loadingContacts.get()) return
-                        val value = param.args[0] as? CharSequence ?: return
+                        if (fixing.get()) return
                         val view = param.thisObject as? TextView ?: return
-                        val restored = restoreStoredSpacingForContext(view.context, value.toString())
-                        if (restored != null && restored != value.toString()) {
-                            param.args[0] = restored
-                        }
+                        val value = param.args[0] as? CharSequence ?: return
+                        val fixed = restoreForTextView(view, value.toString())
+                        if (fixed != null && fixed != value.toString()) param.args[0] = fixed
                     }
                 }
             )
 
-            // Also restore a contact name used as accessibility/content description.
+            if (DEBUG_MODE) installDebugTextHooks(classLoader)
+
+            // Xiaomi can change/rebind a row after setText(). Re-check immediately before draw.
+            XposedHelpers.findAndHookMethod(
+                TextView::class.java,
+                "onDraw",
+                Canvas::class.java,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        restoreTextView(param.thisObject as? TextView)
+                    }
+                }
+            )
+
             XposedHelpers.findAndHookMethod(
                 View::class.java,
                 "setContentDescription",
                 CharSequence::class.java,
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (loadingContacts.get()) return
+                        if (fixing.get()) return
                         val view = param.thisObject as? View ?: return
                         val value = param.args[0] as? CharSequence ?: return
-                        val restored = restoreStoredSpacingForContext(view.context, value.toString())
-                        if (restored != null && restored != value.toString()) {
-                            param.args[0] = restored
-                        }
+                        val fixed = restoreForTextView(view as? TextView, value.toString())
+                        if (fixed != null && fixed != value.toString()) param.args[0] = fixed
                     }
                 }
             )
 
+            hookXiaomiContactListClasses(classLoader)
+            hookExactXiaomiContactBinding(classLoader)
+            hookActivityResume(classLoader)
+
+            XposedBridge.log("$LOG_TAG: Xiaomi Contacts v1.0.3 DEBUG hooks installed")
+        } catch (t: Throwable) {
+            XposedBridge.log("$LOG_TAG: Contacts hook error: ${t.stackTraceToString()}")
+        }
+    }
+
+    /**
+     * Xiaomi's contact list has its own ContactListItemView.  The important difference
+     * from the old version is that we first try to identify the exact contact represented
+     * by the row, then read that contact's DISPLAY_NAME. This removes the ambiguity of a
+     * global "AB" -> "A B" map when both forms exist in the address book.
+     */
+    private fun hookXiaomiContactListClasses(classLoader: ClassLoader) {
+        val candidates = listOf(
+            "com.android.contacts.list.ContactListItemView",
+            "com.android.contacts.list.DefaultContactListAdapter",
+            "com.android.contacts.list.ContactListAdapter"
+        )
+
+        for (name in candidates) {
+            try {
+                val clazz = XposedHelpers.findClass(name, classLoader)
+                if (!hookedContactClasses.add(name)) continue
+
+                for (method in clazz.declaredMethods) {
+                    val n = method.name.lowercase(Locale.ROOT)
+                    if (!(n.contains("bind") || n.contains("name") || n.contains("contact") ||
+                                n.contains("display") || n.contains("settext") || n.contains("setname"))) {
+                        continue
+                    }
+                    try {
+                        method.isAccessible = true
+                        XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                            override fun beforeHookedMethod(param: MethodHookParam) {
+                                if (DEBUG_MODE) debugLogContactMethod("BEFORE", method, param)
+                            }
+
+                            override fun afterHookedMethod(param: MethodHookParam) {
+                                val v = param.thisObject as? View ?: return
+                                if (DEBUG_MODE) debugLogContactMethod("AFTER", method, param)
+                                fixContactRow(v)
+                            }
+                        })
+                    } catch (_: Throwable) {
+                        // Some synthetic/bridge methods cannot be hooked; the TextView hook remains.
+                    }
+                }
+                XposedBridge.log("$LOG_TAG: Hooked Xiaomi class $name")
+            } catch (_: Throwable) {
+                // Class may not exist in another Contacts build.
+            }
+        }
+    }
+
+    /**
+     * Exact diagnostics for Xiaomi Contacts 18.30.00.17.
+     * The previous generic method-name filter missed the obfuscated adapter method F3,
+     * which is the actual row-binding entry point in this build:
+     * F3(ContactListItemView, int, Cursor, int, int, int, String, int).
+     * This hook does not change the UI; it only records the real cursor/name flow.
+     */
+    private fun hookExactXiaomiContactBinding(classLoader: ClassLoader) {
+        try {
+            val adapter = XposedHelpers.findClass(
+                "com.android.contacts.list.DefaultContactListAdapter", classLoader
+            )
+            XposedHelpers.findAndHookMethod(
+                adapter,
+                "F3",
+                XposedHelpers.findClass("com.android.contacts.list.ContactListItemView", classLoader),
+                Int::class.javaPrimitiveType,
+                android.database.Cursor::class.java,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                String::class.java,
+                Int::class.javaPrimitiveType,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        debugLogF3("BEFORE", param)
+                    }
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        debugLogF3("AFTER", param)
+                    }
+                }
+            )
+            XposedBridge.log("$LOG_TAG: DEBUG exact F3(ContactListItemView,Cursor,...) hook installed")
+        } catch (t: Throwable) {
+            XposedBridge.log("$LOG_TAG: DEBUG exact F3 hook error: ${t.stackTraceToString()}")
+        }
+
+        // The row view has an explicit G(Cursor,String,int,int) method in this APK.
+        try {
+            val row = XposedHelpers.findClass(
+                "com.android.contacts.list.ContactListItemView", classLoader
+            )
+            XposedHelpers.findAndHookMethod(
+                row,
+                "G",
+                android.database.Cursor::class.java,
+                String::class.java,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        debugLogRowMethod("G BEFORE", param)
+                    }
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        debugLogRowMethod("G AFTER", param)
+                    }
+                }
+            )
+            XposedBridge.log("$LOG_TAG: DEBUG exact ContactListItemView.G hook installed")
+        } catch (t: Throwable) {
+            XposedBridge.log("$LOG_TAG: DEBUG exact G hook error: ${t.message}")
+        }
+    }
+
+    private fun debugLogF3(stage: String, param: XC_MethodHook.MethodHookParam) {
+        if (!DEBUG_MODE) return
+        try {
+            val row = param.args.getOrNull(0)
+            val cursor = param.args.getOrNull(2) as? android.database.Cursor
+            val cursorInfo = dumpCursorIdentity(cursor)
+            val rowClass = row?.javaClass?.name ?: "null"
+            val uri = try {
+                val m = row?.javaClass?.methods?.firstOrNull { it.name == "getmUri" && it.parameterTypes.isEmpty() }
+                m?.invoke(row)?.toString()
+            } catch (_: Throwable) { null }
+            XposedBridge.log(
+                "$LOG_TAG: DEBUG F3 $stage row=$rowClass uri=${uri ?: "null"} " +
+                        "arg1=${debugValue(param.args.getOrNull(1))} arg3=${debugValue(param.args.getOrNull(3))} " +
+                        "arg4=${debugValue(param.args.getOrNull(4))} arg5=${debugValue(param.args.getOrNull(5))} " +
+                        "arg6=${debugValue(param.args.getOrNull(6))} arg7=${debugValue(param.args.getOrNull(7))} " +
+                        "cursor=$cursorInfo"
+            )
+        } catch (t: Throwable) {
+            XposedBridge.log("$LOG_TAG: DEBUG F3 log error: ${t.message}")
+        }
+    }
+
+    private fun debugLogRowMethod(stage: String, param: XC_MethodHook.MethodHookParam) {
+        if (!DEBUG_MODE) return
+        try {
+            val cursor = param.args.getOrNull(0) as? android.database.Cursor
+            XposedBridge.log(
+                "$LOG_TAG: DEBUG ROW $stage this=${param.thisObject?.javaClass?.name} " +
+                        "arg1=${debugValue(param.args.getOrNull(1))} " +
+                        "arg2=${debugValue(param.args.getOrNull(2))} " +
+                        "arg3=${debugValue(param.args.getOrNull(3))} cursor=${dumpCursorIdentity(cursor)}"
+            )
+        } catch (t: Throwable) {
+            XposedBridge.log("$LOG_TAG: DEBUG ROW log error: ${t.message}")
+        }
+    }
+
+    private fun dumpCursorIdentity(cursor: android.database.Cursor?): String {
+        if (cursor == null) return "null"
+        return try {
+            val parts = ArrayList<String>()
+            val cols = cursor.columnNames
+            for (i in cols.indices) {
+                if (i >= 40) break
+                val value = try { cursor.getString(i) } catch (_: Throwable) { "<non-string>" }
+                parts.add("${cols[i]}=${quoteForLog(value ?: "null")}")
+            }
+            "pos=${cursor.position} count=${cursor.count} {${parts.joinToString(", ")}}"
+        } catch (t: Throwable) {
+            "cursor-error=${t.message}"
+        }
+    }
+
+    private fun hookActivityResume(classLoader: ClassLoader) {
+        try {
             XposedHelpers.findAndHookMethod(
                 "android.app.Activity",
                 classLoader,
@@ -162,219 +317,199 @@ class MainHook : IXposedHookLoadPackage {
                         val activity = param.thisObject as? android.app.Activity ?: return
                         if (activity.packageName == CONTACTS_PACKAGE) {
                             contactNameMap.clear()
+                            contactNameById.clear()
                             loadedContexts.remove(CONTACTS_PACKAGE)
                         }
                     }
                 }
             )
-
-            hookXiaomiContactListRow(classLoader)
-            XposedBridge.log("$LOG_TAG: Xiaomi Contacts text/draw hooks installed")
-        } catch (t: Throwable) {
-            XposedBridge.log("$LOG_TAG: Contacts hook error: ${t.stackTraceToString()}")
-        }
+        } catch (_: Throwable) {}
     }
 
-    /**
-     * Xiaomi 18.30.x has a dedicated ContactListItemView and the main list adapter
-     * binds every row through DefaultContactListAdapter.F3(...).  Hooking that bind
-     * point is more reliable than trying to infer the original name from a TextView:
-     * the cursor/view already identifies the exact contact row.
-     */
-    private fun hookXiaomiContactListRow(classLoader: ClassLoader) {
+    private fun fixContactRow(view: View) {
+        if (fixing.get()) return
         try {
-            val itemViewClass = XposedHelpers.findClass(
-                "com.android.contacts.list.ContactListItemView",
-                classLoader
-            )
-
-            // Exact bind method found in Xiaomi Contacts 18.30.00.17:
-            // F3(ContactListItemView, int, Cursor, int, int, int, String, int)
-            XposedHelpers.findAndHookMethod(
-                "com.android.contacts.list.DefaultContactListAdapter",
-                classLoader,
-                "F3",
-                itemViewClass,
-                Int::class.javaPrimitiveType,
-                Cursor::class.java,
-                Int::class.javaPrimitiveType,
-                Int::class.javaPrimitiveType,
-                Int::class.javaPrimitiveType,
-                String::class.java,
-                Int::class.javaPrimitiveType,
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        val itemView = param.args[0] ?: return
-                        restoreExactContactName(itemView, classLoader)
-                    }
-                }
-            )
-
-            // setUri is the row's exact contact URI.  Catching it gives us another
-            // reliable point even when Xiaomi recycles rows without F3 being called
-            // again in the usual way.
-            XposedHelpers.findAndHookMethod(
-                itemViewClass,
-                "setUri",
-                Uri::class.java,
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        restoreExactContactName(param.thisObject, classLoader)
-                    }
-                }
-            )
-
-            // The list row exposes getNameTextView(), so we can correct the actual
-            // child used for the contact name rather than every TextView in Contacts.
-            XposedHelpers.findAndHookMethod(
-                itemViewClass,
-                "onLayout",
-                Boolean::class.javaPrimitiveType,
-                Int::class.javaPrimitiveType,
-                Int::class.javaPrimitiveType,
-                Int::class.javaPrimitiveType,
-                Int::class.javaPrimitiveType,
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        restoreExactContactName(param.thisObject, classLoader)
-                    }
-                }
-            )
-
-            XposedBridge.log("$LOG_TAG: Exact Xiaomi contact-row hook installed")
+            fixing.set(true)
+            fixViewTree(view)
         } catch (t: Throwable) {
-            XposedBridge.log("$LOG_TAG: Contact-row hook error: ${t.stackTraceToString()}")
+            XposedBridge.log("$LOG_TAG: row fix error: ${t.message}")
+        } finally {
+            fixing.set(false)
         }
     }
 
-    private fun restoreExactContactName(itemView: Any?, classLoader: ClassLoader) {
-        if (itemView == null || loadingContacts.get()) return
-        try {
-            val uri = XposedHelpers.callMethod(itemView, "getmUri") as? Uri ?: return
-            if (!isContactsUri(uri)) return
-
-            val view = itemView as? View ?: return
-            val context = view.context
-            val name = queryExactDisplayName(context, uri) ?: return
-            if (name.isEmpty() || !name.any { it.isWhitespace() }) return
-
-            val nameView = XposedHelpers.callMethod(itemView, "getNameTextView") as? TextView
-                ?: return
-            val displayed = nameView.text?.toString() ?: return
-
-            // Correct only the known failure mode: Xiaomi's displayed value is the
-            // same characters as the stored name, but whitespace has disappeared.
-            // This prevents us from overwriting highlighted/search text or another
-            // unrelated string shown in the row.
-            if (displayed != name &&
-                displayed.isNotEmpty() &&
-                whitespaceFreeKey(displayed) == whitespaceFreeKey(name)) {
-                nameView.text = name
-            }
-        } catch (t: Throwable) {
-            XposedBridge.log("$LOG_TAG: Exact row restore error: ${t.message}")
-        }
-    }
-
-    private fun isContactsUri(uri: Uri): Boolean {
-        return uri.authority == ContactsContract.AUTHORITY &&
-                (uri.pathSegments.firstOrNull() == "contacts" ||
-                 uri.pathSegments.firstOrNull() == "raw_contacts")
-    }
-
-    private fun queryExactDisplayName(context: Context, uri: Uri): String? {
-        return try {
-            val resolver = context.contentResolver
-            resolver.query(
-                uri,
-                arrayOf(ContactsContract.Contacts.DISPLAY_NAME),
-                null,
-                null,
-                null
-            )?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    val index = cursor.getColumnIndex(ContactsContract.Contacts.DISPLAY_NAME)
-                    if (index >= 0) cursor.getString(index) else null
-                } else null
-            }
-        } catch (t: Throwable) {
-            XposedBridge.log("$LOG_TAG: Exact name query error: ${t.message}")
-            null
+    private fun fixViewTree(view: View) {
+        if (view is TextView) restoreTextView(view)
+        if (view is ViewGroup) {
+            for (i in 0 until view.childCount) fixViewTree(view.getChildAt(i))
         }
     }
 
     private fun restoreTextView(view: TextView?) {
-        if (view == null || loadingContacts.get()) return
+        if (view == null || fixing.get()) return
+        val text = view.text?.toString() ?: return
+        if (!looksLikeArabicOrMixedContactText(text)) return
+
         try {
-            val text = view.text?.toString() ?: return
-            val restored = restoreStoredSpacingForContext(view.context, text)
-            if (restored != null && restored != text) {
-                view.text = restored
-            }
+            fixing.set(true)
+            val restored = restoreForTextView(view, text)
+            if (restored != null && restored != text) view.text = restored
         } catch (t: Throwable) {
             XposedBridge.log("$LOG_TAG: draw restore error: ${t.message}")
+        } finally {
+            fixing.set(false)
         }
     }
 
-    private fun restoreStoredSpacingForContext(context: Context, text: String): String? {
-        if (!looksLikeArabicOrMixedContactText(text)) return null
+    private fun restoreForTextView(view: TextView?, text: String): String? {
+        if (text.isBlank() || !looksLikeArabicOrMixedContactText(text)) return null
+        // In DEBUG mode we deliberately do not modify the displayed text.
+        // This lets the logs capture Xiaomi's untouched input/output path.
+        if (DEBUG_MODE && view?.context?.packageName == CONTACTS_PACKAGE) return null
+
+        // 1) Exact row/contact identity if this TextView belongs to ContactListItemView.
+        val contactId = findContactIdFromView(view)
+        if (contactId != null && contactId > 0) {
+            val original = getDisplayNameById(view?.context, contactId)
+            if (original != null && whitespaceFreeKey(original) == whitespaceFreeKey(text)) {
+                XposedBridge.log("$LOG_TAG: Restored contactId=$contactId: '$text' -> '$original'")
+                return original
+            }
+        }
+
+        // 2) Fallback for detail screens where there is no exposed row id.
+        val context = view?.context ?: return null
         ensureContactNameCache(context)
-        return restoreStoredSpacing(text)
+        return contactNameMap[whitespaceFreeKey(text)]
+    }
+
+    private fun findContactIdFromView(view: View?): Long? {
+        var current: Any? = view
+        var depth = 0
+        while (current != null && depth++ < 8) {
+            val direct = readLongField(current, setOf("mcontactid", "contactid", "contact_id", "mcontact_id"))
+            if (direct != null && direct > 0) return direct
+
+            val uri = readUriField(current)
+            if (uri != null) {
+                val segments = uri.pathSegments
+                for (i in segments.indices) {
+                    if (segments[i].equals("contacts", true) && i + 1 < segments.size) {
+                        segments[i + 1].toLongOrNull()?.let { if (it > 0) return it }
+                    }
+                }
+            }
+
+            current = if (current is View) current.parent else null
+        }
+        return null
+    }
+
+    private fun readLongField(obj: Any, wanted: Set<String>): Long? {
+        for (field in allFields(obj.javaClass)) {
+            val n = field.name.lowercase(Locale.ROOT)
+            val isExact = wanted.contains(n)
+            val isContactIdLike = n.contains("contact") && n.endsWith("id")
+            if (!isExact && !isContactIdLike) continue
+            try {
+                field.isAccessible = true
+                val value = field.get(obj)
+                when (value) {
+                    is Number -> return value.toLong()
+                    is String -> value.toLongOrNull()?.let { return it }
+                }
+            } catch (_: Throwable) {}
+        }
+        return null
+    }
+
+    private fun readUriField(obj: Any): Uri? {
+        for (field in allFields(obj.javaClass)) {
+            val n = field.name.lowercase(Locale.ROOT)
+            if (!(n.contains("contacturi") || n == "uri" || n.contains("contact_uri"))) continue
+            try {
+                field.isAccessible = true
+                val value = field.get(obj)
+                if (value is Uri) return value
+                if (value is String) return Uri.parse(value)
+            } catch (_: Throwable) {}
+        }
+        return null
+    }
+
+    private fun allFields(clazz: Class<*>): List<Field> {
+        val result = ArrayList<Field>()
+        var c: Class<*>? = clazz
+        while (c != null && c != Any::class.java) {
+            result.addAll(c.declaredFields)
+            c = c.superclass
+        }
+        return result
+    }
+
+    private fun getDisplayNameById(context: Context?, contactId: Long): String? {
+        if (context == null) return null
+        contactNameById[contactId]?.let { return it }
+        try {
+            val cursor = context.contentResolver.query(
+                ContactsContract.Contacts.CONTENT_URI,
+                arrayOf(ContactsContract.Contacts.DISPLAY_NAME),
+                "${ContactsContract.Contacts._ID}=?",
+                arrayOf(contactId.toString()),
+                null
+            )
+            cursor?.use {
+                if (it.moveToFirst()) {
+                    val name = it.getString(0)
+                    if (!name.isNullOrEmpty()) {
+                        contactNameById[contactId] = name
+                        return name
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            XposedBridge.log("$LOG_TAG: exact contact query error: ${t.message}")
+        }
+        return null
     }
 
     private fun ensureContactNameCache(context: Context) {
         if (loadedContexts.contains(CONTACTS_PACKAGE)) return
         if (!loadedContexts.add(CONTACTS_PACKAGE)) return
-
         try {
-            loadingContacts.set(true)
-            val resolver = context.contentResolver
-            val projection = arrayOf(ContactsContract.Contacts.DISPLAY_NAME)
-            val cursor = resolver.query(
+            val cursor = context.contentResolver.query(
                 ContactsContract.Contacts.CONTENT_URI,
-                projection,
+                arrayOf(ContactsContract.Contacts._ID, ContactsContract.Contacts.DISPLAY_NAME),
                 "${ContactsContract.Contacts.DISPLAY_NAME} IS NOT NULL AND ${ContactsContract.Contacts.DISPLAY_NAME} != ?",
                 arrayOf(""),
                 null
             )
-
             cursor?.use {
-                val index = it.getColumnIndex(ContactsContract.Contacts.DISPLAY_NAME)
-                if (index >= 0) {
-                    while (it.moveToNext()) {
-                        val original = it.getString(index) ?: continue
+                val idIndex = it.getColumnIndex(ContactsContract.Contacts._ID)
+                val nameIndex = it.getColumnIndex(ContactsContract.Contacts.DISPLAY_NAME)
+                while (it.moveToNext()) {
+                    val id = if (idIndex >= 0) it.getLong(idIndex) else -1L
+                    val original = if (nameIndex >= 0) it.getString(nameIndex) else null
+                    if (id > 0 && !original.isNullOrEmpty()) contactNameById[id] = original
+                    if (!original.isNullOrEmpty()) {
                         val key = whitespaceFreeKey(original)
-                        if (key.isEmpty() || key == original) continue
-
-                        // Only restore a name when the whitespace-free form maps to one
-                        // unique stored name. If two contacts collapse to the same key
-                        // (e.g. "A B" and "AB"), skip it rather than guessing.
-                        val previous = contactNameMap.putIfAbsent(key, original)
-                        if (previous != null && previous != original) {
-                            contactNameMap.remove(key)
+                        if (key.isNotEmpty() && key != original) {
+                            val previous = contactNameMap.putIfAbsent(key, original)
+                            if (previous != null && previous != original) contactNameMap.remove(key)
                         }
                     }
                 }
             }
-
-            XposedBridge.log("$LOG_TAG: Loaded ${contactNameMap.size} unambiguous contact spacing entries")
+            XposedBridge.log("$LOG_TAG: Loaded ${contactNameById.size} contact names")
         } catch (t: Throwable) {
             XposedBridge.log("$LOG_TAG: Contact cache error: ${t.message}")
-        } finally {
-            loadingContacts.set(false)
         }
-    }
-
-    private fun restoreStoredSpacing(text: String): String? {
-        val key = whitespaceFreeKey(text)
-        if (key.isEmpty()) return null
-        return contactNameMap[key]
     }
 
     private fun whitespaceFreeKey(value: String): String {
         return value.replace(Regex("\\s+"), "")
-            .replace('\u200C'.toString(), "")
-            .replace('\u200D'.toString(), "")
+            .replace("\u200C", "")
+            .replace("\u200D", "")
     }
 
     private fun looksLikeArabicOrMixedContactText(text: String): Boolean {
@@ -383,11 +518,253 @@ class MainHook : IXposedHookLoadPackage {
         var hasArabic = false
         for (ch in text) {
             if (Character.isLetter(ch)) hasLetter = true
-            if (ch in '\u0600'..'\u06FF' || ch in '\u0750'..'\u077F' || ch in '\u08A0'..'\u08FF') {
-                hasArabic = true
-            }
+            if (ch in '\u0600'..'\u06FF' || ch in '\u0750'..'\u077F' || ch in '\u08A0'..'\u08FF') hasArabic = true
         }
         return hasLetter && hasArabic
+    }
+
+    /**
+     * Diagnostic mode. It intentionally does not assume which Xiaomi class owns the
+     * visible contact name. It records the actual TextView class, resource id, text,
+     * parent chain, and matching DISPLAY_NAME values from ContactsContract.
+     * Read the entries from LSPosed -> Logs after reproducing the problem once.
+     */
+    private fun installDebugTextHooks(classLoader: ClassLoader) {
+        try {
+            // Hook every TextView.setText overload. The previous build used two exact
+            // signatures and produced no runtime diagnostics, so this build deliberately
+            // uses hookAllMethods and logs the first raw values without an Arabic filter.
+            var setTextHooks = 0
+            for (method in TextView::class.java.declaredMethods) {
+                if (method.name != "setText") continue
+                try {
+                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            val v = param.thisObject as? TextView ?: return
+                            if (v.context?.packageName != CONTACTS_PACKAGE) return
+                            val value = param.args.firstOrNull { it is CharSequence } as? CharSequence
+                            val text = value?.toString() ?: return
+                            debugRawText("setText BEFORE", v, text)
+                        }
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            val v = param.thisObject as? TextView ?: return
+                            if (v.context?.packageName != CONTACTS_PACKAGE) return
+                            debugRawText("setText AFTER", v, v.text?.toString() ?: return)
+                        }
+                    })
+                    setTextHooks++
+                } catch (_: Throwable) {}
+            }
+            XposedBridge.log("$LOG_TAG: DEBUG3 hookAll setText overloads=$setTextHooks")
+
+            // Capture TextViews as soon as Xiaomi attaches them to the window.
+            XposedHelpers.findAndHookMethod(
+                View::class.java,
+                "onAttachedToWindow",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val v = param.thisObject as? View ?: return
+                        if (v.context?.packageName != CONTACTS_PACKAGE) return
+                        if (v is TextView) {
+                            debugRawText("ATTACHED", v, v.text?.toString() ?: "")
+                        }
+                    }
+                }
+            )
+
+            // Dump the visible hierarchy after each activity resumes. This tells us
+            // whether the contact name is actually a TextView and which class owns it.
+            XposedHelpers.findAndHookMethod(
+                android.app.Activity::class.java,
+                "onWindowFocusChanged",
+                Boolean::class.javaPrimitiveType,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val activity = param.thisObject as? android.app.Activity ?: return
+                        val hasFocus = param.args.getOrNull(0) as? Boolean ?: return
+                        if (!hasFocus || activity.packageName != CONTACTS_PACKAGE) return
+                        val root = activity.window?.decorView ?: return
+                        dumpVisibleTextViews(root)
+                    }
+                }
+            )
+
+            // Hook the exact Xiaomi classes, but enumerate ALL methods instead of relying
+            // on guessed names/signatures. We only log calls with interesting arguments.
+            hookAllMethodsForDiagnostics(
+                classLoader,
+                "com.android.contacts.list.ContactListItemView"
+            )
+            hookAllMethodsForDiagnostics(
+                classLoader,
+                "com.android.contacts.list.DefaultContactListAdapter"
+            )
+
+            XposedBridge.log("$LOG_TAG: DEBUG3 broad diagnostics installed")
+        } catch (t: Throwable) {
+            XposedBridge.log("$LOG_TAG: DEBUG3 install error: ${t.stackTraceToString()}")
+        }
+    }
+
+    private fun debugRawText(stage: String, view: TextView, text: String) {
+        if (!DEBUG_MODE) return
+        if (text.isEmpty() && stage != "ATTACHED") return
+        val resource = try {
+            if (view.id == View.NO_ID) "NO_ID" else view.context.resources.getResourceName(view.id)
+        } catch (_: Throwable) { "?" }
+        val spaces = text.count { it.isWhitespace() }
+        val arabic = text.count { it in '\u0600'..'\u06FF' || it in '\u0750'..'\u077F' || it in '\u08A0'..'\u08FF' }
+        val key = "RAW|$stage|${view.javaClass.name}|$resource|$text"
+        if (!debugSeen.add(key)) return
+        if (debugSeen.size > MAX_RAW_TEXT_LOGS) return
+        XposedBridge.log(
+            "$LOG_TAG: DEBUG3 $stage class=${view.javaClass.name} res=$resource " +
+                    "spaces=$spaces arabic=$arabic text=${quoteForLog(text)}"
+        )
+    }
+
+    private fun dumpVisibleTextViews(root: View) {
+        var count = 0
+        fun walk(v: View, depth: Int) {
+            if (count >= MAX_VIEW_ATTACH_LOGS || depth > 12) return
+            if (v is TextView) {
+                val text = v.text?.toString() ?: ""
+                if (text.isNotEmpty()) {
+                    debugRawText("FOCUS", v, text)
+                    count++
+                }
+            }
+            if (v is ViewGroup) {
+                for (i in 0 until v.childCount) walk(v.getChildAt(i), depth + 1)
+            }
+        }
+        walk(root, 0)
+        XposedBridge.log("$LOG_TAG: DEBUG3 hierarchy textViews=$count")
+    }
+
+    private fun hookAllMethodsForDiagnostics(classLoader: ClassLoader, className: String) {
+        try {
+            val clazz = XposedHelpers.findClass(className, classLoader)
+            var hooked = 0
+            for (method in clazz.declaredMethods) {
+                try {
+                    method.isAccessible = true
+                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            if (!DEBUG_MODE) return
+                            val interesting = param.args.any { arg ->
+                                arg is CharSequence || arg is android.database.Cursor || arg is Number
+                            }
+                            if (!interesting) return
+                            XposedBridge.log(
+                                "$LOG_TAG: DEBUG3 METHOD BEFORE ${clazz.name}.${method.name}" +
+                                        " args=${param.args.joinToString(prefix="[", postfix="]") { debugValue(it) }}"
+                            )
+                        }
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            if (!DEBUG_MODE) return
+                            val result = param.result
+                            if (result is CharSequence || result is Number || result is android.database.Cursor) {
+                                XposedBridge.log(
+                                    "$LOG_TAG: DEBUG3 METHOD AFTER ${clazz.name}.${method.name}" +
+                                            " result=${debugValue(result)}"
+                                )
+                            }
+                        }
+                    })
+                    hooked++
+                } catch (_: Throwable) {}
+            }
+            XposedBridge.log("$LOG_TAG: DEBUG3 ALL METHODS class=$className hooked=$hooked total=${clazz.declaredMethods.size}")
+        } catch (t: Throwable) {
+            XposedBridge.log("$LOG_TAG: DEBUG3 ALL METHODS error class=$className error=${t.message}")
+        }
+    }
+
+    private fun debugLogTextView(stage: String, view: TextView?, text: String?) {
+        if (!DEBUG_MODE || view == null || text.isNullOrBlank()) return
+        if (!looksLikeArabicOrMixedContactText(text)) return
+        val normalized = whitespaceFreeKey(text)
+        val resource = try {
+            if (view.id == View.NO_ID) "NO_ID" else view.context.resources.getResourceName(view.id)
+        } catch (_: Throwable) { "?" }
+        val parentNames = ArrayList<String>()
+        var p: Any? = view.parent
+        var depth = 0
+        while (p != null && depth++ < 5) {
+            parentNames.add(p.javaClass.name)
+            p = if (p is View) p.parent else null
+        }
+        val key = "TV|$stage|${view.javaClass.name}|$resource|$normalized"
+        if (!debugSeen.add(key)) return
+
+        XposedBridge.log(
+            "$LOG_TAG: DEBUG $stage class=${view.javaClass.name} res=$resource " +
+                    "text=${quoteForLog(text)} normalized=${quoteForLog(normalized)} " +
+                    "parents=${parentNames.joinToString(" <- ")}"
+        )
+
+        debugFindMatchingContactNames(view.context, text)
+    }
+
+    private fun debugFindMatchingContactNames(context: Context, displayed: String) {
+        try {
+            val key = whitespaceFreeKey(displayed)
+            if (key.isEmpty()) return
+            val cursor = context.contentResolver.query(
+                ContactsContract.Contacts.CONTENT_URI,
+                arrayOf(ContactsContract.Contacts._ID, ContactsContract.Contacts.DISPLAY_NAME),
+                "${ContactsContract.Contacts.DISPLAY_NAME} IS NOT NULL",
+                null,
+                null
+            ) ?: return
+            cursor.use {
+                var count = 0
+                val idIndex = it.getColumnIndex(ContactsContract.Contacts._ID)
+                val nameIndex = it.getColumnIndex(ContactsContract.Contacts.DISPLAY_NAME)
+                while (it.moveToNext() && count < 8) {
+                    val name = if (nameIndex >= 0) it.getString(nameIndex) else null
+                    if (!name.isNullOrEmpty() && whitespaceFreeKey(name) == key) {
+                        val id = if (idIndex >= 0) it.getLong(idIndex) else -1L
+                        XposedBridge.log("$LOG_TAG: DEBUG CONTACT MATCH id=$id original=${quoteForLog(name)} displayed=${quoteForLog(displayed)}")
+                        count++
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            XposedBridge.log("$LOG_TAG: DEBUG contact query error: ${t.message}")
+        }
+    }
+
+    private fun debugLogContactMethod(stage: String, method: Method, param: XC_MethodHook.MethodHookParam) {
+        try {
+            val obj = param.thisObject
+            val args = param.args.mapIndexed { i, a -> "arg$i=${debugValue(a)}" }.joinToString(", ")
+            val key = "METHOD|$stage|${method.declaringClass.name}|${method.name}|$args"
+            if (!debugSeen.add(key)) return
+            XposedBridge.log("$LOG_TAG: DEBUG $stage ${method.declaringClass.name}.${method.name}(${method.parameterTypes.joinToString { it.name }}) this=${obj?.javaClass?.name} $args")
+        } catch (t: Throwable) {
+            XposedBridge.log("$LOG_TAG: DEBUG method log error: ${t.message}")
+        }
+    }
+
+    private fun debugValue(value: Any?): String {
+        if (value == null) return "null"
+        return when (value) {
+            is CharSequence -> quoteForLog(value.toString().take(200))
+            is Uri -> value.toString()
+            is Number, is Boolean -> value.toString()
+            is View -> "View(${value.javaClass.name},id=${value.id})"
+            else -> value.javaClass.name
+        }
+    }
+
+    private fun quoteForLog(value: String): String {
+        return value.replace("\\", "\\\\")
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            .replace("'", "\\'")
+            .let { "'$it'" }
     }
 
     private fun hookMuteButton() {
@@ -404,14 +781,9 @@ class MainHook : IXposedHookLoadPackage {
                     }
                 }
             }
-
             XposedHelpers.findAndHookMethod(View::class.java, "setEnabled", Boolean::class.javaPrimitiveType, hookEnabled)
             XposedHelpers.findAndHookMethod(View::class.java, "setClickable", Boolean::class.javaPrimitiveType, hookEnabled)
-
-            XposedHelpers.findAndHookMethod(
-                View::class.java,
-                "setAlpha",
-                Float::class.javaPrimitiveType,
+            XposedHelpers.findAndHookMethod(View::class.java, "setAlpha", Float::class.javaPrimitiveType,
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val alpha = param.args[0] as Float
@@ -420,12 +792,8 @@ class MainHook : IXposedHookLoadPackage {
                             if (isTargetView(view)) param.args[0] = 1.0f
                         }
                     }
-                }
-            )
-
-            XposedHelpers.findAndHookMethod(
-                View::class.java,
-                "onAttachedToWindow",
+                })
+            XposedHelpers.findAndHookMethod(View::class.java, "onAttachedToWindow",
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val view = param.thisObject as View
@@ -435,12 +803,8 @@ class MainHook : IXposedHookLoadPackage {
                             if (view.alpha < 1.0f) view.alpha = 1.0f
                         }
                     }
-                }
-            )
-
-            XposedHelpers.findAndHookMethod(
-                View::class.java,
-                "performClick",
+                })
+            XposedHelpers.findAndHookMethod(View::class.java, "performClick",
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val view = param.thisObject as View
@@ -449,18 +813,14 @@ class MainHook : IXposedHookLoadPackage {
                             val currentState = am.isMicrophoneMute
                             android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
                                 try {
-                                    if (am.isMicrophoneMute == currentState) {
-                                        am.isMicrophoneMute = !currentState
-                                        XposedBridge.log("$LOG_TAG: Force-toggled AudioManager to ${!currentState}")
-                                    }
+                                    if (am.isMicrophoneMute == currentState) am.isMicrophoneMute = !currentState
                                 } catch (t: Throwable) {
                                     XposedBridge.log("$LOG_TAG: Audio toggle error: ${t.message}")
                                 }
                             }, 50)
                         }
                     }
-                }
-            )
+                })
         } catch (e: Throwable) {
             XposedBridge.log("$LOG_TAG: Dialer hook error: ${e.stackTraceToString()}")
         }
@@ -469,7 +829,6 @@ class MainHook : IXposedHookLoadPackage {
     private fun isTargetView(view: View): Boolean {
         val clsName = view.javaClass.simpleName.lowercase(Locale.ROOT)
         if (clsName.contains("button") || clsName.contains("toggle")) return true
-
         try {
             if (view.id != View.NO_ID) {
                 val idName = view.context.resources.getResourceEntryName(view.id).lowercase(Locale.ROOT)
@@ -477,13 +836,11 @@ class MainHook : IXposedHookLoadPackage {
                     idName.contains("btn") || idName.contains("action") || idName.contains("incall")) return true
             }
         } catch (_: Exception) {}
-
         try {
             val desc = view.contentDescription?.toString()?.lowercase(Locale.ROOT) ?: ""
             if (desc.contains("mute") || desc.contains("mic") || desc.contains("كتم") ||
                 desc.contains("ميك") || desc.contains("صوت")) return true
         } catch (_: Exception) {}
-
         return false
     }
 
@@ -494,13 +851,11 @@ class MainHook : IXposedHookLoadPackage {
                 if (idName.contains("mute") || idName.contains("mic") || idName.contains("audio")) return true
             }
         } catch (_: Exception) {}
-
         try {
             val desc = view.contentDescription?.toString()?.lowercase(Locale.ROOT) ?: ""
             if (desc.contains("mute") || desc.contains("mic") || desc.contains("كتم") ||
                 desc.contains("ميك") || desc.contains("صوت")) return true
         } catch (_: Exception) {}
-
         return false
     }
 }

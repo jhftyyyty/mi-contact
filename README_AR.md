@@ -1,31 +1,20 @@
-# Xiaomi Arabic Contacts Fix
+# Xiaomi Arabic Contacts Fix - v1.0.3 Debug 3
 
-ده مشروع Xposed/LSPosed خاص بـ Xiaomi Contacts.
+دي نسخة تشخيصية فقط لمشكلة المسافات في أسماء جهات الاتصال داخل Xiaomi Contacts.
 
-## الإصلاح
+## المطلوب
+1. ارفع محتويات المشروع إلى GitHub.
+2. شغّل GitHub Actions.
+3. ثبّت APK الناتج.
+4. فعّل الموديول في LSPosed مع `com.android.contacts`.
+5. اعمل Force Stop لتطبيق جهات الاتصال.
+6. افتح قائمة جهات الاتصال ومرر على أسماء فيها المشكلة مثل `ابو بكر`.
+7. من LSPosed Logs ابحث عن `DialerUnlocker: DEBUG3`.
 
-الإصدار 1.0.2 يستهدف مباشرة `ContactListItemView` داخل قائمة جهات الاتصال، ويستخدم URI الخاص بالصف لقراءة `DISPLAY_NAME` من نفس جهة الاتصال، ثم يعيد الاسم الأصلي فقط عندما تكون المشكلة هي اختفاء المسافات.
+## ما الذي تسجله النسخة؟
+- كل overloads لـ `TextView.setText` داخل `com.android.contacts` لأول عدد محدود من القيم.
+- الـ class وresource ID والنص وعدد المسافات.
+- TextViews الموجودة وقت ظهور نافذة Contacts.
+- كل methods في `ContactListItemView` و`DefaultContactListAdapter` التي تستقبل Cursor أو نص أو أرقام.
 
-التطبيق بيحاول يحافظ على اسم جهة الاتصال **بالضبط كما هو محفوظ** في `ContactsContract.Contacts.DISPLAY_NAME`، حتى لو واجهة Xiaomi عرضته بعد إزالة المسافات.
-
-مثال:
-
-`محمد د فؤاد`
-
-يُفترض يفضل ظاهر بنفس المسافات.
-
-الموديول لا يغيّر قاعدة بيانات جهات الاتصال.
-
-## مهم
-
-- الـ package المستهدف للإصلاح: `com.android.contacts`
-- المشروع يحتوي أيضًا على Hook وظيفة زر الـ Mute القديمة.
-- بعد التثبيت من LSPosed، فعّل `Xiaomi Arabic Contacts Fix` لتطبيق `com.android.contacts`، ثم اعمل Force Stop لتطبيق جهات الاتصال أو أعد تشغيل الهاتف.
-
-## بناء APK بدون خبرة
-
-1. ارفع الملفات إلى GitHub Repository جديد.
-2. اعمل Push إلى branch اسمه `main`.
-3. GitHub Actions سيبني APK تلقائيًا.
-4. الـ workflow ينشئ Release باسم `v1.0.2` تلقائيًا لو مش موجود، ثم يرفع الـ APK إليه.
-5. كمان الـ APK بيتحفظ كـ Actions Artifact.
+النسخة لا تحاول إصلاح النص داخل Contacts أثناء التشخيص؛ الهدف معرفة المسار الحقيقي الذي يحذف المسافات.
