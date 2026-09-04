@@ -39,12 +39,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="v1.0.2"
+          TAG="v1.0.3-debug"
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG already exists"
           else
             gh release create "$TAG" \
-              --title "Xiaomi Arabic Contacts Fix v1.0.2" \
+              --title "Xiaomi Arabic Contacts Fix v1.0.3-debug" \
               --notes "Xposed/LSPosed module: preserves the original whitespace of Arabic contact names in Xiaomi Contacts (com.android.contacts)."
           fi
 
@@ -52,7 +52,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload v1.0.2 \
+          gh release upload v1.0.3-debug \
             app/build/outputs/apk/debug/app-debug.apk \
             --clobber
 

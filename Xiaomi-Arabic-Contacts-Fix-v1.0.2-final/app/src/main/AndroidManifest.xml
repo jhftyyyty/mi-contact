@@ -17,7 +17,7 @@
             android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="Preserves original whitespace in Arabic contact names in Xiaomi Contacts and keeps the existing mute-button hook." />
+            android:value="DEBUG build: traces Xiaomi Contacts text rendering to locate where Arabic contact-name whitespace is removed; mute-button hook retained." />
         <meta-data
             android:name="xposedminversion"
             android:value="93" />
