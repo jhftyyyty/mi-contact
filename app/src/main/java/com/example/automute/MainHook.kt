@@ -1,6 +1,7 @@
 package com.example.automute
 
 import android.content.Context
+import android.graphics.Canvas
 import android.database.Cursor
 import android.media.AudioManager
 import android.provider.ContactsContract
@@ -59,6 +60,34 @@ class MainHook : IXposedHookLoadPackage {
      */
     private fun hookContactsNameDisplay(classLoader: ClassLoader) {
         try {
+            // Xiaomi Contacts can pass the contact name through several UI paths.
+            // We therefore fix it both when TextView receives the text and immediately
+            // before TextView draws it. This covers list rows, contact details and
+            // screens that replace the text after our first hook.
+            val restoreHook = object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    restoreTextView(param.thisObject as? TextView)
+                }
+            }
+
+            XposedHelpers.findAndHookMethod(
+                TextView::class.java,
+                "setText",
+                CharSequence::class.java,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (loadingContacts.get()) return
+                        val value = param.args[0] as? CharSequence ?: return
+                        val text = value.toString()
+                        val view = param.thisObject as? TextView ?: return
+                        val restored = restoreStoredSpacingForContext(view.context, text)
+                        if (restored != null && restored != text) {
+                            param.args[0] = restored
+                        }
+                    }
+                }
+            )
+
             XposedHelpers.findAndHookMethod(
                 TextView::class.java,
                 "setText",
@@ -67,50 +96,62 @@ class MainHook : IXposedHookLoadPackage {
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         if (loadingContacts.get()) return
-
                         val value = param.args[0] as? CharSequence ?: return
                         val text = value.toString()
-                        if (!looksLikeArabicOrMixedContactText(text)) return
-
-                        val context = (param.thisObject as TextView).context
-                        ensureContactNameCache(context)
-
-                        val restored = restoreStoredSpacing(text)
+                        val view = param.thisObject as? TextView ?: return
+                        val restored = restoreStoredSpacingForContext(view.context, text)
                         if (restored != null && restored != text) {
                             param.args[0] = restored
-                            XposedBridge.log("$LOG_TAG: Restored contact spacing: [$text] -> [$restored]")
                         }
                     }
                 }
             )
 
-            // Some widgets call the two-argument overload.
+            // Covers code paths that modify the text after the normal setText hook.
             XposedHelpers.findAndHookMethod(
                 TextView::class.java,
-                "setText",
+                "onDraw",
+                Canvas::class.java,
+                restoreHook
+            )
+
+            // Xiaomi may use setTextKeepState when recycling contact-list rows.
+            XposedHelpers.findAndHookMethod(
+                TextView::class.java,
+                "setTextKeepState",
+                CharSequence::class.java,
+                TextView.BufferType::class.java,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (loadingContacts.get()) return
+                        val value = param.args[0] as? CharSequence ?: return
+                        val view = param.thisObject as? TextView ?: return
+                        val restored = restoreStoredSpacingForContext(view.context, value.toString())
+                        if (restored != null && restored != value.toString()) {
+                            param.args[0] = restored
+                        }
+                    }
+                }
+            )
+
+            // Also restore a contact name used as accessibility/content description.
+            XposedHelpers.findAndHookMethod(
+                View::class.java,
+                "setContentDescription",
                 CharSequence::class.java,
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         if (loadingContacts.get()) return
-
+                        val view = param.thisObject as? View ?: return
                         val value = param.args[0] as? CharSequence ?: return
-                        val text = value.toString()
-                        if (!looksLikeArabicOrMixedContactText(text)) return
-
-                        val context = (param.thisObject as TextView).context
-                        ensureContactNameCache(context)
-
-                        val restored = restoreStoredSpacing(text)
-                        if (restored != null && restored != text) {
+                        val restored = restoreStoredSpacingForContext(view.context, value.toString())
+                        if (restored != null && restored != value.toString()) {
                             param.args[0] = restored
-                            XposedBridge.log("$LOG_TAG: Restored contact spacing: [$text] -> [$restored]")
                         }
                     }
                 }
             )
 
-            // Refresh the cache when the Contacts app resumes. This catches newly
-            // added/edited names without touching the provider data.
             XposedHelpers.findAndHookMethod(
                 "android.app.Activity",
                 classLoader,
@@ -121,14 +162,34 @@ class MainHook : IXposedHookLoadPackage {
                         if (activity.packageName == CONTACTS_PACKAGE) {
                             contactNameMap.clear()
                             loadedContexts.remove(CONTACTS_PACKAGE)
-                            ensureContactNameCache(activity)
                         }
                     }
                 }
             )
+
+            XposedBridge.log("$LOG_TAG: Xiaomi Contacts text/draw hooks installed")
         } catch (t: Throwable) {
             XposedBridge.log("$LOG_TAG: Contacts hook error: ${t.stackTraceToString()}")
         }
+    }
+
+    private fun restoreTextView(view: TextView?) {
+        if (view == null || loadingContacts.get()) return
+        try {
+            val text = view.text?.toString() ?: return
+            val restored = restoreStoredSpacingForContext(view.context, text)
+            if (restored != null && restored != text) {
+                view.text = restored
+            }
+        } catch (t: Throwable) {
+            XposedBridge.log("$LOG_TAG: draw restore error: ${t.message}")
+        }
+    }
+
+    private fun restoreStoredSpacingForContext(context: Context, text: String): String? {
+        if (!looksLikeArabicOrMixedContactText(text)) return null
+        ensureContactNameCache(context)
+        return restoreStoredSpacing(text)
     }
 
     private fun ensureContactNameCache(context: Context) {
