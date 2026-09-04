@@ -8,7 +8,7 @@
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
-        android:label="Mute Button Enabler"
+        android:label="Xiaomi Arabic Contacts Fix"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.DeviceDefault.Light">
 
@@ -17,7 +17,7 @@
             android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="Enables the mute button automatically before answering the call." />
+            android:value="Preserves original whitespace in Arabic contact names in Xiaomi Contacts and keeps the existing mute-button hook." />
         <meta-data
             android:name="xposedminversion"
             android:value="93" />

@@ -120,6 +120,7 @@ class MainHook : IXposedHookLoadPackage {
                         val activity = param.thisObject as? android.app.Activity ?: return
                         if (activity.packageName == CONTACTS_PACKAGE) {
                             contactNameMap.clear()
+                            loadedContexts.remove(CONTACTS_PACKAGE)
                             ensureContactNameCache(activity)
                         }
                     }
@@ -131,14 +132,14 @@ class MainHook : IXposedHookLoadPackage {
     }
 
     private fun ensureContactNameCache(context: Context) {
-        if (loadedContexts.contains(CONTACTS_PACKAGE) && contactNameMap.isNotEmpty()) return
-        if (!loadedContexts.add(CONTACTS_PACKAGE) && loadingContacts.get()) return
+        if (loadedContexts.contains(CONTACTS_PACKAGE)) return
+        if (!loadedContexts.add(CONTACTS_PACKAGE)) return
 
         try {
             loadingContacts.set(true)
             val resolver = context.contentResolver
             val projection = arrayOf(ContactsContract.Contacts.DISPLAY_NAME)
-            val cursor: Cursor? = resolver.query(
+            val cursor = resolver.query(
                 ContactsContract.Contacts.CONTENT_URI,
                 projection,
                 "${ContactsContract.Contacts.DISPLAY_NAME} IS NOT NULL AND ${ContactsContract.Contacts.DISPLAY_NAME} != ?",
@@ -152,16 +153,20 @@ class MainHook : IXposedHookLoadPackage {
                     while (it.moveToNext()) {
                         val original = it.getString(index) ?: continue
                         val key = whitespaceFreeKey(original)
-                        if (key.isNotEmpty() && key != original) {
-                            // Keep the first exact stored value for a key. If two names
-                            // collapse to the same key, an ambiguous restoration is skipped.
-                            contactNameMap.putIfAbsent(key, original)
+                        if (key.isEmpty() || key == original) continue
+
+                        // Only restore a name when the whitespace-free form maps to one
+                        // unique stored name. If two contacts collapse to the same key
+                        // (e.g. "A B" and "AB"), skip it rather than guessing.
+                        val previous = contactNameMap.putIfAbsent(key, original)
+                        if (previous != null && previous != original) {
+                            contactNameMap.remove(key)
                         }
                     }
                 }
             }
 
-            XposedBridge.log("$LOG_TAG: Loaded ${contactNameMap.size} contact spacing entries")
+            XposedBridge.log("$LOG_TAG: Loaded ${contactNameMap.size} unambiguous contact spacing entries")
         } catch (t: Throwable) {
             XposedBridge.log("$LOG_TAG: Contact cache error: ${t.message}")
         } finally {
