@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string-array name="xposed_scope">
+        <item>com.android.incallui</item>
+        <item>com.android.contacts</item>
+        <item>com.google.android.dialer</item>
+        <item>com.miui.incallui</item>
+        <item>com.xiaomi.incallui</item>
+        <item>com.android.phone</item>
+        <item>com.android.server.telecom</item>
+    </string-array>
+</resources>
